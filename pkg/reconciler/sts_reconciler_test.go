@@ -842,6 +842,33 @@ func TestStatefulSetReconciler_rollingUpdateParameters(t *testing.T) {
 			expectPartition: 0,
 			wantErr:         false,
 		},
+		{
+			name: "invalid maxSurge must not be masked by the partition defer",
+			rollingStrategy: &workloadsv1alpha2.RolloutStrategy{
+				Type: workloadsv1alpha2.RollingUpdateStrategyType,
+				RollingUpdate: &workloadsv1alpha2.RollingUpdate{
+					MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+					MaxSurge:       ptr.To(intstr.FromString("invalid")),
+					Partition:      ptr.To(intstr.FromInt32(0)),
+				},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-rbg-test-role",
+					Namespace: "default",
+					UID:       "sts-uid",
+					Annotations: map[string]string{
+						constants.RoleSizeAnnotationKey: "4",
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: commonLabels},
+					Replicas: ptr.To(int32(4)),
+				},
+			},
+			podList: &corev1.PodList{},
+			wantErr: true,
+		},
 	}
 
 	oldRevision := &appsv1.ControllerRevision{
