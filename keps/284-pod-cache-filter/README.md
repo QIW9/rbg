@@ -24,8 +24,8 @@ relist peaks can fall with the retained store. Without streaming lists, startup 
 decoding the complete List.
 
 Separately from cache admission, RoleInstance and Warmup set `rbg.workloads.x-k8s.io/managed=true`
-on the Pods they create, and existing Pods are labeled by an admin CLI that Helm runs as a
-pre-upgrade hook. The marker is never written into a workload template, so no existing Pod rolls.
+on the Pods they create. An admin CLI labels existing Pods and runs by default as a Helm
+pre-upgrade hook. The marker stays out of workload templates, so existing Pods keep their revisions.
 
 ## Motivation
 
@@ -53,6 +53,7 @@ behave.
 - Writing the marker into any workload template (Deployment, StatefulSet, LeaderWorkerSet,
   RoleInstanceSet, RoleInstance), or rolling workloads to add it.
 - Migrating the v1alpha1 API or retiring the legacy labels.
+- Pod cache metrics and the controller RBAC needed to scrape them are deferred to a separate change.
 - Other unfiltered informers, tracked separately: ConfigMaps (started by the legacy discovery probe
   through the cached client), CustomResourceDefinitions and webhook configurations (webhook
   certificate controller), ControllerRevisions, and PodGroups.
@@ -118,18 +119,17 @@ flowchart LR
 3. **Transitions follow events.** A Pod that gains an admission label is stored whole at its next
    event; one that loses its last admission label is replaced by a stub; a Pod that references an
    RBG object never becomes a stub. Delete events carry whichever form was stored.
-4. **Stubs never reach a production read path that expects a Pod.** Every cached Pod List in the
-   operator is scoped by an RBG label selector or by the ownerReference-UID index:
-   `sts_reconciler.go` (StatefulSet selector), `getOwnedPods` (owner index),
-   `rolebasedgroupwarmup_controller.go` (group-name; warmup name and UID), and
-   `rolebasedgroup_controller.go` (group-name and role-name). Each of them requires an admission
-   label or an ownerReference to an RBG object, and a stub has neither, or it would have been
-   admitted, so no stub matches. Node-name reads in `RecordNodeBindings`, Warmup and RBG
-   reconciliation consume Pods from these scoped Lists; none uses a `spec.nodeName` field selector.
-   Both Pod event sources map a Pod through an ownerReference to an RBG kind
-   (the RoleInstance Pod handler and Warmup's `Owns`),
-   so a stub enqueues nothing. Only an unscoped List would see stubs, which is why the read-path
-   audit is an alpha criterion.
+4. **Reads that need Pod status or spec consume whole Pods.** Cached Pod Lists in the operator
+   are scoped by a workload selector or the ownerReference-UID field index. The StatefulSet
+   reconciler normally lists by a selector that requires group-name. An adopted StatefulSet
+   can retain another selector, so if its cached List returns a stub, the rollout logic repeats
+   that List against the API server with the same namespace and selector. RoleInstance owner
+   lookups, Warmup reads and RBG scheduling counts require an admission label or an ownerReference
+   to an RBG object. Node-name reads use Pods from those Lists. Both Pod event sources map a Pod
+   through an ownerReference to an RBG kind, so a stub enqueues nothing. The read-path audit
+   guards against adding cached Lists that would interpret a stub as a whole Pod.
+   Restart budget reads list Pods directly through the API with the RoleInstance selector and
+   verify the controller UID.
 5. **Named existence checks stay in the cache.** `getExistingPod` finds an unrelated Pod's stub,
    `metav1.IsControlledBy` returns false, and the controller reports the name conflict as it does
    today, with no extra API read. Gang-scheduled instances, which must confirm every name before
@@ -160,31 +160,32 @@ it. The marker stays out of the RoleInstanceSet and RoleInstance templates, so r
 unaffected, and Deployment, StatefulSet, and LeaderWorkerSet templates are never stamped; their Pods
 are admitted through `group-name`.
 
-**No template rolling update.** `objectMetaEqual` compares workload metadata exactly after
-`FilterSystemLabels`, which strips `app.kubernetes.io/` and the legacy
-`rolebasedgroup.workloads.x-k8s.io/` prefix but not `rbg.workloads.x-k8s.io/`. A marker in a
-workload template would therefore be label drift and roll every Pod of that workload. The design
-avoids that in two ways:
-
-1. The marker is never written into a template (above).
-2. As a guard, `FilterSystemLabels` ignores the `rbg.workloads.x-k8s.io/managed` key, and only that
-   key: ignoring the whole prefix would hide `group-name`, `role-name`, and `group-uid` drift. The
-   contract tests `TestFilterSystemLabelsIgnoresManagedMarker` and
-   `TestPodTemplateSpecEqualIgnoresManagedMarker` become regression tests, alongside a test that
-   `group-name` drift is still detected.
+**No template rolling update.** The controller and migration write the marker to Pod objects only,
+not workload templates. Existing template comparisons are unchanged: if a user explicitly adds,
+changes or removes the marker in a template, that change remains visible to the reconciler.
+Regression tests cover template and Service label drift.
 
 **Backfill CLI.** Existing Pods are labeled by `kubectl rbg migrate pod-labels`:
 
 - For each legacy key it lists candidates with the server-side selector
   `<legacy-key>,!rbg.workloads.x-k8s.io/managed`, and patches only the marker.
-- Patches carry a UID precondition; `--dry-run`, a rate limit, and safe re-runs are supported.
+- Patches test the UID and current labels without a resourceVersion precondition, so concurrent
+  status updates do not block migration and concurrent label changes are rechecked. `--dry-run`,
+  a rate limit, and safe re-runs are supported.
 - No owner-chain validation: the legacy label already identifies the Pod, and admission is not
   ownership.
-- A read-only `check` mode reports unmarked Pods and deprecated workload templates without the
-  marker. It is the observable completion criterion that an in-controller background job could
-  not provide.
-- Helm runs it as a best-effort `pre-upgrade` hook: on failure it reports what is left and does not
-  block the upgrade. Manifest installs run it once by hand.
+- A read-only `check` mode reports Pods and deprecated workload templates without `managed=true`,
+  including Pods with an explicit non-true value. Migration leaves existing marker values intact;
+  operators must resolve those cases before `check` can pass. This provides an observable
+  completion criterion that an in-controller background job could not provide. An omitted
+  LeaderWorkerSet leader template uses the worker template and is not counted separately.
+- Helm runs it as a best-effort pre-upgrade hook, enabled by default. The hook logs command
+  failures and remaining work without failing the Job. Helm waits for hook Jobs even without
+  `--wait-for-jobs`: a Job that cannot start or times out can still fail the upgrade. Hook RBAC
+  is removed after successful execution; on failure, cleanup depends on the Helm version and
+  failure point. A later upgrade with the hook enabled replaces any remaining RBAC. Job logs
+  remain until the configured TTL. Manifest installs and upgrades with hooks disabled run the
+  CLI by hand.
 
 Pods that deprecated workloads create later stay unmarked until the next run; `check` reports them
 until those workloads migrate to RoleInstanceSet. Cache visibility never depends on the marker, so
@@ -193,7 +194,8 @@ retiring the legacy label conditions in favor of the marker alone is a later, se
 
 ### Enablement
 
-These operator and Helm controls are proposed by this KEP; production integration is pending.
+The chart passes cache flags only when their options are enabled. Use a controller image that
+supports the selected flags and includes the migration CLI when the Job is enabled.
 
 | Setting | Values | Default | Effect |
 | --- | --- | --- | --- |
@@ -225,28 +227,28 @@ mechanism and verifies the effective value; its environment variable is explicit
 
 | Risk | Mitigation |
 | --- | --- |
-| A future unscoped Pod List sees stubs | Read-path audit as an alpha criterion; a regression test that every cached Pod List is selector- or index-scoped; the `rbg_pod_cache_stub_reads_total` metric |
-| An RBG Pod is not admitted | Admission covers the three legacy labels, the marker, and any ownerReference to an RBG object; creation-path tests; whole and stub counts are exported |
-| The marker in a template rolls existing Pods | Never written into templates; key-scoped drift exemption with contract tests; an upgrade e2e asserting zero template diffs |
+| A future Pod List interprets a stub as a whole Pod | Read-path audit as an alpha criterion; regression tests for scoped Pod Lists and the StatefulSet API fallback |
+| An RBG Pod is not admitted | Admission covers the three legacy labels, the marker, and any ownerReference to an RBG object; creation-path tests |
+| The marker in a template rolls existing Pods | Never written into templates; tests verify template label drift is still detected |
 | List startup still decodes all Pods | Budget from measured ranges; with a supporting server, the optional WatchListClient and early watch wrapper reduce the shared-shape peak |
 | A transform defect hides Pod data | `--pod-cache-scope=all` restores today's cache with a restart; unit tests for every admission condition and for idempotence |
-| Backfill load on the apiserver | Server-side selector, rate limit, `--dry-run`; it runs once per upgrade, not continuously |
+| Backfill load on the apiserver | Server-side selector, rate limit, `--dry-run`; when enabled, it runs once per upgrade |
 
 ## Design Details
 
 ### Test Plan
 
 The prototype tests named below are in the harness described in [Performance](performance.md).
-The macOS/Linux cache tests have run; marking, CLI, Helm and full operator e2e criteria remain
-production-integration work.
+The cases below are the production-integration test plan; consult the repository tests and their
+results for the scenarios actually verified.
 
 #### Unit Tests
 
 - Transform: each admission condition alone and combined, `managed=false`, controller versus
   non-controller references to RBG kinds, a foreign controller, non-Pod input, `managedFields`
   stripping, stub contents, and idempotence (prototype: `TestTransformIsIdempotent`).
-- Drift: `FilterSystemLabels` and `podTemplateSpecEqual` ignore only the marker key, and
-  `group-name` drift is still reported.
+- Drift: `podTemplateSpecEqual` and workload metadata still detect changes to the marker and other
+  labels.
 - CLI: candidate selection per legacy key, `--dry-run`, UID precondition, conflict retry, rate
   limit, and `check` output.
 
@@ -264,6 +266,8 @@ production-integration work.
   (prototype: `TestAPITransformTransitionsAndEvents`).
 - An owned Pod stripped of every admission label is still returned by `getOwnedPods`, and the
   RoleInstance does not under-count or try to replace it.
+- A StatefulSet retaining a selector that matches a stub reads the full Pod through the
+  same namespace and selector and advances its rollout partition.
 - Ownership collision: an unrelated Pod with the same name is found as a stub, and the controller
   reports the conflict without Create→AlreadyExists or an extra API read.
 - Streaming list, fallback to List, and relist after an expired watch (410), with the apiserver's
@@ -281,10 +285,12 @@ production-integration work.
   RoleInstanceSet workloads produces zero template diffs and no Pod restarts.
 - Pods created by RoleInstance, Deployment, StatefulSet, LeaderWorkerSet (leader and worker), and
   Warmup are admitted whole; Warmup actions and timeouts are unaffected.
-- Rolling back to the previous image, and switching `--pod-cache-scope` both ways, keep every Pod
-  visible.
-- The Helm pre-upgrade hook labels existing Pods, and `check` reports completion and the
-  deprecated workloads that still produce unmarked Pods.
+- An immediate rollback after upgrade keeps existing Pods visible. Switching `--pod-cache-scope`
+  both ways preserves Pods, templates, and revisions.
+- The Helm pre-upgrade hook labels existing Pods before the new controller starts. `check` reports
+  completion and deprecated workloads that still produce unmarked Pods. A migration command error
+  logs a warning and lets the upgrade proceed. A Job that cannot start stops the rollout, and a
+  successful retry removes the temporary RBAC.
 
 ### Graduation Criteria
 
@@ -294,12 +300,11 @@ production-integration work.
   watch-stream wrapper. Helm exposes both settings in [Enablement](#enablement), with
   `WatchListClient` off by default.
 - The Pod read-path audit is recorded in the implementation PR, with a regression test.
-- RoleInstance and Warmup stamp the marker on created Pods; no template carries it; the key-scoped
-  drift exemption ships with its contract tests.
+- RoleInstance and Warmup stamp the marker on created Pods without changing templates; template
+  label comparisons retain their existing behavior.
 - `kubectl rbg migrate pod-labels` with `check`, `--dry-run`, and a rate limit, plus the Helm
   pre-upgrade hook.
 - Unit and integration tests in the repository; the upgrade e2e asserts zero template diffs.
-- The [Monitoring](#monitoring) metrics are exported.
 
 #### Beta
 
@@ -314,16 +319,6 @@ production-integration work.
 
 - One release with `filtered` as the default and no Pod-visibility incident.
 - The decision on retiring the legacy label conditions, based on `check` reports, is recorded.
-
-### Monitoring
-
-| Metric | Type | Meaning |
-| --- | --- | --- |
-| `rbg_pod_cache_scope{scope}` | gauge | configured scope, `all` or `filtered`, set to 1 |
-| `rbg_pod_cache_objects{form}` | gauge | cached Pods by `form`: `whole` or `stub` |
-| `rbg_pod_cache_transform_total{result}` | counter | transform decisions by `result`: `whole` or `stub` |
-| `rbg_pod_cache_stub_reads_total{method}` | counter | stubs returned by a cached `List`; it should stay 0, and a non-zero value means an unscoped read path |
-| `rbg_pod_cache_initial_sync_seconds` | gauge | duration of the Pod informer's initial sync |
 
 ### Expected Impact
 
@@ -397,7 +392,8 @@ reproduction commands and coverage limits are in [Performance](performance.md).
 - **CPU:** one transform per List item, and two per watched object with the early wrapper. Startup
   and relist results vary by platform; sustained event churn still needs measurement.
 - **Writes:** controllers stamp labels only on creation; the rate-limited CLI patches existing Pods.
-- **Reads:** no boundary reads; named existence checks remain cached.
+- **Reads:** named existence checks remain cached. A StatefulSet rollout makes a scoped API
+  List when its cached List contains a stub.
 
 ### Upgrade, Rollback, and Version Skew
 
@@ -410,6 +406,12 @@ reproduction commands and coverage limits are in [Performance](performance.md).
 - **Kubernetes versions:** the transform works on every supported version. Streaming lists depend
   on the apiserver's `WatchList` feature, whose default has changed across releases; the client
   falls back to List when it is not served. The supported matrix is a beta criterion.
+
+After a v1alpha1 write on the upgraded release, a legacy LeaderWorkerSet role's
+`restartPolicy: None` can be stored as `restartPolicyConfig.type: None`. v0.7.0 only reads the
+legacy field. A downgrade at that point may change the rendered LeaderWorkerSet policy to
+`RecreateGroupOnPodRestart` and roll its Pods, even without Pod cache filtering or backfill.
+Set `controller.podCacheScope=all` on the current release to disable filtering in place.
 
 ## Production Readiness Review Questionnaire
 
@@ -480,7 +482,7 @@ present, are alpha criteria.
 - **Event handlers still run for unrelated Pod events.** Their full input must still be decoded
   and dispatched; sustained event-load costs have not been measured here.
 - **Correctness relies on scoped reads.** A future unscoped Pod List would silently see stubs;
-  the audit, its regression test, and the stub-read metric guard against it.
+  the audit and its regression tests guard against it.
 - **The marker becomes a de facto public interface,** and manifest installs need a one-time CLI
   run.
 
